@@ -12,8 +12,8 @@ import (
 )
 
 type PortfolioHierarchy struct {
-	key       string
-	reference string
+	key        string
+	references []string
 }
 
 type PortfolioReference struct {
@@ -26,15 +26,22 @@ type PortfoliosResponse struct {
 	Portfolios []Portfolio `json:"portfolios"`
 }
 
+type SubView struct {
+	Key  string `json:"key"`
+	Name string `json:"name"`
+}
+
+type ShowPortfolio struct {
+	Key      string    `json:"key"`
+	SubViews []SubView `json:"subViews"`
+}
+
 func resourceSonarqubePortfolioHierarchy() *schema.Resource {
 	return &schema.Resource{
 		Create: resourceSonarqubePortfolioHierarchyCreate,
 		Read:   resourceSonarqubePortfolioHierarchyRead,
 		Update: resourceSonarqubePortfolioHierarchyUpdate,
 		Delete: resourceSonarqubePortfolioHierarchyDelete,
-		Importer: &schema.ResourceImporter{
-			State: resourceSonarqubeGroupImport,
-		},
 
 		// Define the fields of this schema.
 		Schema: map[string]*schema.Schema{
@@ -44,11 +51,14 @@ func resourceSonarqubePortfolioHierarchy() *schema.Resource {
 				Required:    true,
 				Computed:    false,
 			},
-			"reference": {
-				Type:        schema.TypeString,
-				Description: "Key of the portfolio to be added.",
+			"references": {
+				Type:        schema.TypeList,
+				Description: "List of portfolio keys to be added.",
 				Required:    true,
 				Computed:    false,
+				Elem: &schema.Schema{
+					Type: schema.TypeString,
+				},
 			},
 		},
 	}
@@ -78,48 +88,56 @@ func resourceSonarqubePortfolioHierarchyCreate(d *schema.ResourceData, m interfa
 func resourceSonarqubePortfolioHierarchyUpdate(d *schema.ResourceData, m interface{}) error {
 
 	log.Printf("Execute update method")
+	oldReferences, newReferences := d.GetChange("references")
+	oldRef := processListString(oldReferences.([]interface{}))
+	newRef := processListString(newReferences.([]interface{}))
+	log.Printf("newReferences: %s", newRef)
 
 	if d.HasChange("key") {
+		oldKey, newKey := d.GetChange("key")
 		err := GetPortfolioReference(d, m)
 		if err != nil {
+			log.Printf("newKey: %s", newKey)
+
+			d.Set("key", oldKey.(string))
 			return err
 		}
 
-		oldValue, newValue := d.GetChange("reference")
-		if oldValue != newValue {
-			portfolioHierarchyObject := GetPortfolioResourceInput(d, m)
-			portfolioHierarchyObject.reference = oldValue.(string)
-
-			err := DeleteChildPortfolio(portfolioHierarchyObject, d, m)
-			if err != nil {
-				return err
-			}
+		data := PortfolioHierarchy{oldKey.(string), oldRef}
+		err = DeleteChildPortfolio(&data, d, m)
+		if err != nil {
+			return err
 		}
 
 		return resourceSonarqubePortfolioHierarchyCreate(d, m)
 	}
 
-	if d.HasChange("reference") {
+	if d.HasChange("references") {
 		err := GetPortfolioReference(d, m)
 		if err != nil {
+			d.Set("references", oldReferences)
 			return err
 		}
+		oldRef := processListString(oldReferences.([]interface{}))
+		newRef := processListString(newReferences.([]interface{}))
 
-		oldValue, newValue := d.GetChange("reference")
-		if oldValue != newValue {
-			portfolioHierarchyObject := GetPortfolioResourceInput(d, m)
-			portfolioHierarchyObject.reference = oldValue.(string)
-			err := DeleteChildPortfolio(portfolioHierarchyObject, d, m)
-			if err != nil {
-				return err
-			}
+		addReferences, removeReferences := getDifferences(oldRef, newRef)
 
-			err = PostChildPortfolio(portfolioHierarchyObject, d, m)
+		data := PortfolioHierarchy{d.Get("key").(string), removeReferences}
+		if len(removeReferences) > 0 {
+			err := DeleteChildPortfolio(&data, d, m)
 			if err != nil {
 				return err
 			}
 		}
 
+		if len(addReferences) > 0 {
+			data.references = addReferences
+			err := PostChildPortfolio(&data, d, m)
+			if err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
@@ -128,6 +146,18 @@ func resourceSonarqubePortfolioHierarchyUpdate(d *schema.ResourceData, m interfa
 func resourceSonarqubePortfolioHierarchyRead(d *schema.ResourceData, m interface{}) error {
 
 	log.Printf("Execute read method")
+	portfolioHierarchyObject := GetPortfolioResourceInput(d, m)
+	portfolioShow, err := GetPortfolioHierarchy(portfolioHierarchyObject, d, m)
+	if err != nil {
+		return err
+	}
+
+	reference := []string{}
+	for _, ref := range portfolioShow.SubViews {
+		reference = append(reference, ref.Key)
+	}
+	d.Set("key", portfolioShow.Key)
+	d.Set("reference", reference)
 
 	return nil
 }
@@ -146,10 +176,47 @@ func resourceSonarqubePortfolioHierarchyDelete(d *schema.ResourceData, m interfa
 	return nil
 }
 
+func getDifferences(oldRefs, newRefs []string) (add, remove []string) {
+	oldSet := make(map[string]struct{})
+	newSet := make(map[string]struct{})
+
+	for _, ref := range oldRefs {
+		oldSet[ref] = struct{}{}
+	}
+	for _, ref := range newRefs {
+		newSet[ref] = struct{}{}
+	}
+
+	for ref := range newSet {
+		if _, exists := oldSet[ref]; !exists {
+			add = append(add, ref)
+		}
+	}
+
+	for ref := range oldSet {
+		if _, exists := newSet[ref]; !exists {
+			remove = append(remove, ref)
+		}
+	}
+	return
+}
+
+func processListString(rawReferences []interface{}) []string {
+	references := make([]string, len(rawReferences))
+
+	for i, ref := range rawReferences {
+		references[i] = ref.(string)
+	}
+
+	return references
+}
+
 func GetPortfolioResourceInput(d *schema.ResourceData, m interface{}) *PortfolioHierarchy {
+	references := processListString(d.Get("references").([]interface{}))
+
 	return &PortfolioHierarchy{
-		key:       d.Get("key").(string),
-		reference: d.Get("reference").(string),
+		key:        d.Get("key").(string),
+		references: references,
 	}
 }
 
@@ -162,7 +229,7 @@ func GetPortfolioReference(d *schema.ResourceData, m interface{}) error {
 		"portfolio": []string{portfolioHierarchyObject.key},
 	}.Encode()
 
-	resp, err := executeHttpMethod(method, d, m, apiURL, rawQuery, http.StatusOK)
+	resp, err := executeHttpMethod(method, m, apiURL, rawQuery, http.StatusOK)
 	if err != nil {
 		return err
 	}
@@ -180,9 +247,9 @@ func GetPortfolioReference(d *schema.ResourceData, m interface{}) error {
 		listKeyRefs = append(listKeyRefs, portfolio.Key)
 	}
 
-	removeOwnPortlifo(portfolioHierarchyObject.key, &listKeyRefs)
+	removeOwnPortfolio(portfolioHierarchyObject.key, &listKeyRefs)
 
-	err = validateReference(portfolioHierarchyObject.reference, listKeyRefs)
+	err = validateReference(portfolioHierarchyObject.references, listKeyRefs)
 	if err != nil {
 		return err
 	}
@@ -190,35 +257,39 @@ func GetPortfolioReference(d *schema.ResourceData, m interface{}) error {
 	return nil
 }
 
-func GetPortfolioHierarchy(data *PortfolioHierarchy, d *schema.ResourceData, m interface{}) ([]string, error) {
+func GetPortfolioHierarchy(data *PortfolioHierarchy, d *schema.ResourceData, m interface{}) (*ShowPortfolio, error) {
 	apiURL := "api/views/show"
 	method := "GET"
 	rawQuery := url.Values{
-		"portfolio": []string{data.key},
+		"key": []string{data.key},
 	}.Encode()
 
-	resp, err := executeHttpMethod(method, d, m, apiURL, rawQuery, http.StatusOK)
+	resp, err := executeHttpMethod(method, m, apiURL, rawQuery, http.StatusOK)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("Response: %+v", resp)
 
-	return nil, nil
+	portfolioShow := ShowPortfolio{}
+	err = json.NewDecoder(resp.Body).Decode(&portfolioShow)
+
+	return &portfolioShow, nil
 }
 
 func PostChildPortfolio(data *PortfolioHierarchy, d *schema.ResourceData, m interface{}) error {
 	apiURL := "api/views/add_portfolio"
 	method := "POST"
-	rawQuery := url.Values{
-		"portfolio": []string{data.key},
-		"reference": []string{data.reference},
-	}.Encode()
+	for _, ref := range data.references {
+		rawQuery := url.Values{
+			"portfolio": []string{data.key},
+			"reference": []string{ref},
+		}.Encode()
 
-	resp, err := executeHttpMethod(method, d, m, apiURL, rawQuery, http.StatusOK)
-	if err != nil {
-		return err
+		resp, err := executeHttpMethod(method, m, apiURL, rawQuery, http.StatusOK)
+		if err != nil {
+			return err
+		}
+		log.Printf("Response: %+v", resp)
 	}
-	log.Printf("Response: %+v", resp)
 
 	return nil
 }
@@ -226,30 +297,39 @@ func PostChildPortfolio(data *PortfolioHierarchy, d *schema.ResourceData, m inte
 func DeleteChildPortfolio(data *PortfolioHierarchy, d *schema.ResourceData, m interface{}) error {
 	apiURL := "api/views/remove_portfolio"
 	method := "POST"
-	rawQuery := url.Values{
-		"portfolio": []string{data.key},
-		"reference": []string{data.reference},
-	}.Encode()
+	for _, ref := range data.references {
+		rawQuery := url.Values{
+			"portfolio": []string{data.key},
+			"reference": []string{ref},
+		}.Encode()
 
-	resp, err := executeHttpMethod(method, d, m, apiURL, rawQuery, http.StatusNoContent)
-	if err != nil {
-		return err
+		resp, err := executeHttpMethod(method, m, apiURL, rawQuery, http.StatusNoContent)
+		if err != nil {
+			return err
+		}
+		log.Printf("Response: %+v", resp)
+
 	}
-	log.Printf("Response: %+v", resp)
 
 	return nil
 }
 
-func validateReference(inputRef string, unSelectedRef []string) error {
+func validateReference(inputRef []string, unSelectedRef []string) error {
+	refMap := make(map[string]bool)
 	for _, ref := range unSelectedRef {
-		if ref == inputRef {
-			return nil
+		refMap[ref] = true
+	}
+	// Kiểm tra từng phần tử trong inputRef
+	for _, ref := range inputRef {
+		if !refMap[ref] {
+			// Nếu phần tử không tồn tại trong unSelectedRef, trả về lỗi
+			return fmt.Errorf("reference %s is not exits in Unselected Reference", ref)
 		}
 	}
-	return fmt.Errorf("Value '%s' in inputRef not exits in Unselected Reference", inputRef)
+	return nil
 }
 
-func removeOwnPortlifo(parent string, unSelectedRef *[]string) {
+func removeOwnPortfolio(parent string, unSelectedRef *[]string) {
 	ref := *unSelectedRef
 
 	var result []string
@@ -261,7 +341,7 @@ func removeOwnPortlifo(parent string, unSelectedRef *[]string) {
 	*unSelectedRef = result
 }
 
-func executeHttpMethod(method string, d *schema.ResourceData, m interface{}, apiURL string, rawQuery string, status int) (*http.Response, error) {
+func executeHttpMethod(method string, m interface{}, apiURL string, rawQuery string, status int) (*http.Response, error) {
 	sonarQubeURL := m.(*ProviderConfiguration).sonarQubeURL
 	sonarQubeURL.Path = strings.TrimSuffix(sonarQubeURL.Path, "/") + apiURL
 
